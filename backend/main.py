@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import math
@@ -288,8 +289,14 @@ async def startup() -> None:
 
 
 def _cache_paths(track_id: str) -> tuple[Path, Path]:
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", track_id)
-    return MEDIA_CACHE_DIR / f"{safe_name}.mp3", MEDIA_CACHE_DIR / f"{safe_name}.json"
+    """Build cache file paths from a hash of track_id so no user input reaches the filesystem path."""
+    digest = hashlib.sha256(track_id.encode("utf-8")).hexdigest()
+    cache_root = MEDIA_CACHE_DIR.resolve()
+    audio_path = (cache_root / f"{digest}.mp3").resolve()
+    meta_path = (cache_root / f"{digest}.json").resolve()
+    if cache_root not in (audio_path, *audio_path.parents) or cache_root not in (meta_path, *meta_path.parents):
+        raise HTTPException(status_code=400, detail="Invalid track id")
+    return audio_path, meta_path
 
 
 async def _fetch_audio(track_id: str) -> tuple[bytes, str, str]:
