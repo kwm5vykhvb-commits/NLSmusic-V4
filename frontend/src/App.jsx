@@ -1,122 +1,94 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import { useEffect, useRef, useState } from 'react'
+import Header from './components/Header'
+import Player from './components/Player'
+import Sidebar from './components/Sidebar'
+import { downloadTrack } from './lib/api'
+import DownloadsPage from './pages/DownloadsPage'
+import PlaceholderPage from './pages/PlaceholderPage'
+import SearchPage from './pages/SearchPage'
 
-function App() {
-  const [count, setCount] = useState(0)
+const STREAM_URL = import.meta.env.VITE_STREAM_SAMPLE || 'https://archive.org/download/testmp3testfile/mpthreetest.mp3'
 
-  return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+function normalizePath(pathname) {
+  return pathname === '/' ? '/search' : pathname
 }
 
-export default App
+export default function App() {
+  const [path, setPath] = useState(() => normalizePath(window.location.pathname))
+  const [query, setQuery] = useState('')
+  const [currentTrack, setCurrentTrack] = useState(null)
+  const [playing, setPlaying] = useState(false)
+  const audioRef = useRef(new Audio(STREAM_URL))
+
+  useEffect(() => {
+    const onPop = () => setPath(normalizePath(window.location.pathname))
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
+  const onNavigate = (nextPath) => {
+    const normalized = normalizePath(nextPath)
+    window.history.pushState({}, '', normalized)
+    setPath(normalized)
+  }
+
+  const onQueryChange = (value) => {
+    setQuery(value)
+    if (path !== '/search') {
+      onNavigate('/search')
+    }
+  }
+
+  const onPlay = (track) => {
+    setCurrentTrack(track)
+    if (playing) {
+      audioRef.current.pause()
+      setPlaying(false)
+      return
+    }
+    audioRef.current.play().catch(() => null)
+    setPlaying(true)
+  }
+
+  const onToggle = () => {
+    if (!playing) {
+      audioRef.current.play().catch(() => null)
+      setPlaying(true)
+      return
+    }
+    audioRef.current.pause()
+    setPlaying(false)
+  }
+
+  const renderPage = () => {
+    if (path === '/search') {
+      return (
+        <SearchPage query={query} setQuery={onQueryChange} onPlay={onPlay} currentTrack={currentTrack} playing={playing} />
+      )
+    }
+    if (path === '/discover') {
+      return <PlaceholderPage title="Discover" />
+    }
+    if (path === '/library') {
+      return <PlaceholderPage title="Library" />
+    }
+    if (path === '/downloads') {
+      return <DownloadsPage />
+    }
+    if (path === '/playlists') {
+      return <PlaceholderPage title="Playlists" />
+    }
+    return <PlaceholderPage title="Not Found" />
+  }
+
+  return (
+    <div className="flex min-h-screen flex-col md:flex-row">
+      <Sidebar currentPath={path} onNavigate={onNavigate} />
+      <main className="flex-1 p-4">
+        <Header query={query} onQueryChange={onQueryChange} />
+        {renderPage()}
+      </main>
+      <Player track={currentTrack} playing={playing} onToggle={onToggle} onDownload={downloadTrack} />
+    </div>
+  )
+}
