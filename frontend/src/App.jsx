@@ -2,12 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import Header from './components/Header'
 import Player from './components/Player'
 import Sidebar from './components/Sidebar'
-import { downloadTrack } from './lib/api'
+import { downloadTrack, streamTrackUrl } from './lib/api'
 import DownloadsPage from './pages/DownloadsPage'
 import PlaceholderPage from './pages/PlaceholderPage'
 import SearchPage from './pages/SearchPage'
-
-const STREAM_URL = import.meta.env.VITE_STREAM_SAMPLE || 'https://archive.org/download/testmp3testfile/mpthreetest.mp3'
 
 function normalizePath(pathname) {
   return pathname === '/' ? '/search' : pathname
@@ -18,12 +16,27 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [currentTrack, setCurrentTrack] = useState(null)
   const [playing, setPlaying] = useState(false)
-  const audioRef = useRef(new Audio(STREAM_URL))
+  const [progress, setProgress] = useState({ currentTime: 0, duration: 0 })
+  const audioRef = useRef(new Audio())
 
   useEffect(() => {
     const onPop = () => setPath(normalizePath(window.location.pathname))
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    const onTimeUpdate = () => setProgress({ currentTime: audio.currentTime, duration: audio.duration || 0 })
+    const onEnded = () => setPlaying(false)
+    audio.addEventListener('timeupdate', onTimeUpdate)
+    audio.addEventListener('loadedmetadata', onTimeUpdate)
+    audio.addEventListener('ended', onEnded)
+    return () => {
+      audio.removeEventListener('timeupdate', onTimeUpdate)
+      audio.removeEventListener('loadedmetadata', onTimeUpdate)
+      audio.removeEventListener('ended', onEnded)
+    }
   }, [])
 
   const onNavigate = (nextPath) => {
@@ -40,24 +53,45 @@ export default function App() {
   }
 
   const onPlay = (track) => {
-    setCurrentTrack(track)
-    if (playing) {
-      audioRef.current.pause()
-      setPlaying(false)
+    const audio = audioRef.current
+
+    if (currentTrack?.id === track.id) {
+      if (playing) {
+        audio.pause()
+        setPlaying(false)
+      } else {
+        audio.play().catch(() => null)
+        setPlaying(true)
+      }
       return
     }
-    audioRef.current.play().catch(() => null)
+
+    setCurrentTrack(track)
+    setProgress({ currentTime: 0, duration: 0 })
+    audio.pause()
+    audio.src = streamTrackUrl(track.id)
+    audio.currentTime = 0
+    audio.play().catch(() => null)
     setPlaying(true)
   }
 
   const onToggle = () => {
+    if (!currentTrack) {
+      return
+    }
+    const audio = audioRef.current
     if (!playing) {
-      audioRef.current.play().catch(() => null)
+      audio.play().catch(() => null)
       setPlaying(true)
       return
     }
-    audioRef.current.pause()
+    audio.pause()
     setPlaying(false)
+  }
+
+  const onSeek = (time) => {
+    audioRef.current.currentTime = time
+    setProgress((current) => ({ ...current, currentTime: time }))
   }
 
   const renderPage = () => {
@@ -88,7 +122,15 @@ export default function App() {
         <Header query={query} onQueryChange={onQueryChange} />
         {renderPage()}
       </main>
-      <Player track={currentTrack} playing={playing} onToggle={onToggle} onDownload={downloadTrack} />
+      <Player
+        track={currentTrack}
+        playing={playing}
+        progress={progress}
+        onToggle={onToggle}
+        onSeek={onSeek}
+        onDownload={downloadTrack}
+      />
     </div>
   )
 }
+

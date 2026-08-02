@@ -12,7 +12,12 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
   const [results, setResults] = useState({ cloud: [], archives: [] })
   const [suggestions, setSuggestions] = useState({ songs: [], artists: [] })
   const [page, setPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(1)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    setPage(1)
+  }, [query])
 
   useEffect(() => {
     if (!query.trim()) {
@@ -34,6 +39,7 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
   useEffect(() => {
     if (!query.trim()) {
       setResults({ cloud: [], archives: [] })
+      setTotalPages(1)
       return
     }
 
@@ -45,6 +51,7 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
         const data = await searchTracks(query, tab, page)
         if (active) {
           setResults({ cloud: data.cloud, archives: data.archives })
+          setTotalPages(data.totalPages || 1)
         }
       } catch (err) {
         if (active) {
@@ -63,13 +70,16 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
   }, [query, tab, page])
 
   const pagination = useMemo(() => {
-    const cap = 100
+    const windowSize = 5
+    const start = Math.max(1, Math.min(page - Math.floor(windowSize / 2), totalPages - windowSize + 1))
+    const clampedStart = Math.max(1, start)
+    const end = Math.min(totalPages, clampedStart + windowSize - 1)
     const pages = []
-    for (let i = 1; i <= cap && i <= 3 + page; i += 1) {
+    for (let i = clampedStart; i <= end; i += 1) {
       pages.push(i)
     }
     return pages
-  }, [page])
+  }, [page, totalPages])
 
   return (
     <div>
@@ -165,6 +175,14 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
       </AnimatePresence>
 
       <div className="mt-6 flex flex-wrap items-center gap-2 pb-24">
+        <button
+          type="button"
+          onClick={() => setPage((current) => Math.max(1, current - 1))}
+          disabled={page <= 1}
+          className="rounded bg-white/10 px-3 py-1 text-sm text-zinc-300 disabled:opacity-40"
+        >
+          Prev
+        </button>
         {pagination.map((number) => (
           <button
             key={number}
@@ -175,7 +193,12 @@ export default function SearchPage({ query, setQuery, onPlay, currentTrack, play
             {number}
           </button>
         ))}
-        <button type="button" onClick={() => setPage((current) => current + 1)} className="rounded bg-white/10 px-3 py-1 text-sm">
+        <button
+          type="button"
+          onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
+          disabled={page >= totalPages}
+          className="rounded bg-white/10 px-3 py-1 text-sm text-zinc-300 disabled:opacity-40"
+        >
           Next
         </button>
       </div>

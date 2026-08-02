@@ -1,15 +1,20 @@
 import asyncio
+import hashlib
 import io
+import json
+import math
 import os
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeAudio
 
@@ -17,6 +22,8 @@ DB_PATH = "nls_cache.db"
 CHANNEL_HANDLE = "@NLS_music"
 ARCHIVE_SEARCH = "https://archive.org/advancedsearch.php"
 ARCHIVE_METADATA = "https://archive.org/metadata/{identifier}"
+MEDIA_CACHE_DIR = Path(os.getenv("MEDIA_CACHE_DIR", "media_cache"))
+PAGE_SIZE = 100
 
 
 @dataclass
@@ -154,26 +161,33 @@ class NLSCloud:
                 offset_id = min(msg.id for msg in batch)
                 await asyncio.sleep(2)
 
-    async def search(self, query: str, page: int, tab: str) -> list[Track]:
+    async def search(self, query: str, page: int, tab: str) -> tuple[list[Track], int]:
         await self.scan_and_cache()
-        offset = (page - 1) * 100
+        offset = (page - 1) * PAGE_SIZE
         where = "(title LIKE ? OR artist LIKE ?)"
-        params: list[Any] = [f"%{query}%", f"%{query}%", 100, offset]
+        match_params: list[Any] = [f"%{query}%", f"%{query}%"]
 
         if tab == "songs":
             where = "title LIKE ?"
-            params = [f"%{query}%", 100, offset]
+            match_params = [f"%{query}%"]
         elif tab == "artists":
             where = "artist LIKE ?"
-            params = [f"%{query}%", 100, offset]
+            match_params = [f"%{query}%"]
 
         with closing(db_conn()) as conn:
+            total = conn.execute(
+                f"SELECT COUNT(1) AS count FROM cloud_tracks WHERE {where}", match_params
+            ).fetchone()["count"]
             rows = conn.execute(
                 f"SELECT message_id, title, artist, duration FROM cloud_tracks WHERE {where} LIMIT ? OFFSET ?",
-                params,
+                [*match_params, PAGE_SIZE, offset],
             ).fetchall()
 
-        return [Track(id=f"cloud:{row['message_id']}", source="NLS Cloud", title=row["title"], artist=row["artist"], duration=row["duration"]) for row in rows]
+        tracks = [
+            Track(id=f"cloud:{row['message_id']}", source="NLS Cloud", title=row["title"], artist=row["artist"], duration=row["duration"])
+            for row in rows
+        ]
+        return tracks, total
 
     async def suggestions(self, query: str) -> dict[str, list[str]]:
         await self.scan_and_cache()
@@ -210,22 +224,24 @@ class NLSCloud:
 nls_cloud = NLSCloud()
 
 
-async def search_archives(query: str, page: int) -> list[Track]:
+async def search_archives(query: str, page: int) -> tuple[list[Track], int]:
     params = {
         "q": query,
         "fl[]": ["identifier", "title", "creator", "duration"],
         "output": "json",
-        "rows": 100,
+        "rows": PAGE_SIZE,
         "page": page,
     }
 
     async with aiohttp.ClientSession() as session:
         async with session.get(ARCHIVE_SEARCH, params=params, timeout=30) as response:
             if response.status != 200:
-                return []
+                return [], 0
             payload = await response.json()
 
-    docs = payload.get("response", {}).get("docs", [])
+    response_payload = payload.get("response", {})
+    docs = response_payload.get("docs", [])
+    total = response_payload.get("numFound", 0)
     results = []
     for doc in docs:
         identifier = doc.get("identifier")
@@ -240,7 +256,7 @@ async def search_archives(query: str, page: int) -> list[Track]:
                 duration=str(doc.get("duration") or "0:00"),
             )
         )
-    return results
+    return results, total
 
 
 async def download_from_archive(identifier: str) -> tuple[bytes, str, str]:
@@ -269,19 +285,58 @@ async def download_from_archive(identifier: str) -> tuple[bytes, str, str]:
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
+    MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_paths(track_id: str) -> tuple[Path, Path]:
+    """Build cache file paths from a hash of track_id so no user input reaches the filesystem path."""
+    digest = hashlib.sha256(track_id.encode("utf-8")).hexdigest()
+    cache_root = MEDIA_CACHE_DIR.resolve()
+    audio_path = (cache_root / f"{digest}.mp3").resolve()
+    meta_path = (cache_root / f"{digest}.json").resolve()
+    if cache_root not in (audio_path, *audio_path.parents) or cache_root not in (meta_path, *meta_path.parents):
+        raise HTTPException(status_code=400, detail="Invalid track id")
+    return audio_path, meta_path
+
+
+async def _fetch_audio(track_id: str) -> tuple[bytes, str, str]:
+    """Fetch the full mp3 for a track, caching it on disk after the first download."""
+    audio_path, meta_path = _cache_paths(track_id)
+    if audio_path.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return audio_path.read_bytes(), meta["title"], meta["artist"]
+
+    source, _, source_id = track_id.partition(":")
+    if source == "cloud":
+        data, title, artist = await nls_cloud.download(int(source_id))
+    elif source == "archive":
+        data, title, artist = await download_from_archive(source_id)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported source")
+
+    MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(data)
+    meta_path.write_text(json.dumps({"title": title, "artist": artist}), encoding="utf-8")
+    return data, title, artist
 
 
 @app.get("/api/search")
 async def search(query: str = Query(min_length=1), page: int = 1, tab: str = "all") -> dict[str, Any]:
-    cloud_results = await nls_cloud.search(query, page, tab)
+    cloud_results, cloud_total = await nls_cloud.search(query, page, tab)
     archive_results: list[Track] = []
+    archive_total = 0
     if len(cloud_results) < 10:
-        archive_results = await search_archives(query, page)
+        archive_results, archive_total = await search_archives(query, page)
+
+    total = cloud_total + archive_total
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
 
     return {
         "cloud": [track.__dict__ for track in cloud_results],
         "archives": [track.__dict__ for track in archive_results],
         "page": page,
+        "total": total,
+        "totalPages": total_pages,
     }
 
 
@@ -292,16 +347,8 @@ async def suggestions(query: str = Query(min_length=1)) -> dict[str, Any]:
 
 @app.get("/api/download/{track_id}")
 async def download(track_id: str):
-    source, _, source_id = track_id.partition(":")
-
-    if source == "cloud":
-        data, title, artist = await nls_cloud.download(int(source_id))
-        save_source = "NLS Cloud"
-    elif source == "archive":
-        data, title, artist = await download_from_archive(source_id)
-        save_source = "NLS Archives"
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported source")
+    data, title, artist = await _fetch_audio(track_id)
+    save_source = "NLS Cloud" if track_id.startswith("cloud:") else "NLS Archives"
 
     with closing(db_conn()) as conn:
         conn.execute(
@@ -318,8 +365,45 @@ async def download(track_id: str):
     )
 
 
+@app.get("/api/stream/{track_id}")
+async def stream(track_id: str, request: Request):
+    data, title, artist = await _fetch_audio(track_id)
+    total = len(data)
+    filename = f'{title} - {artist}.mp3'.replace('"', "")
+    range_header = request.headers.get("range")
+
+    if range_header:
+        match = re.match(r"bytes=(\d*)-(\d*)", range_header)
+        if not match or (not match.group(1) and not match.group(2)):
+            raise HTTPException(status_code=416, detail="Invalid Range header")
+
+        start = int(match.group(1)) if match.group(1) else 0
+        end = int(match.group(2)) if match.group(2) else total - 1
+        end = min(end, total - 1)
+
+        if start > end or start >= total:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+
+        chunk = data[start : end + 1]
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(chunk)),
+            "Content-Disposition": f'inline; filename="{filename}"',
+        }
+        return Response(content=chunk, status_code=206, media_type="audio/mpeg", headers=headers)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(total),
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    return Response(content=data, media_type="audio/mpeg", headers=headers)
+
+
 @app.get("/api/downloads")
 async def downloads() -> dict[str, Any]:
     with closing(db_conn()) as conn:
         rows = conn.execute("SELECT id, title, artist, source FROM downloads ORDER BY rowid DESC").fetchall()
     return {"items": [dict(row) for row in rows]}
+
